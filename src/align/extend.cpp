@@ -29,6 +29,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #include "../dp/dp.h"
 #include "../util/log_stream.h"
 #include "../data/reference.h"
+#include "../util/system.h"
 
 using std::vector;
 using std::list;
@@ -107,7 +108,7 @@ vector<Target> extend(const Parameters& params,
 	int flags)
 {
 	stat.inc(Statistics::TARGET_HITS1, target_block_ids.size());
-	task_timer timer(flags & TARGET_PARALLEL ? 3 : UINT_MAX);
+	task_timer timer(flags & TARGET_PARALLEL ? config.target_parallel_verbosity : UINT_MAX);
 	if (config.gapped_filter_evalue > 0.0) {
 		timer.go("Computing gapped filter");
 		gapped_filter(query_seq, query_cb, seed_hits, target_block_ids, stat, flags, params);
@@ -143,7 +144,7 @@ vector<Match> extend(const Parameters &params, size_t query_id, hit* begin, hit*
 	for (unsigned i = 0; i < contexts; ++i)
 		query_seq.push_back(query_seqs::get()[query_id*contexts + i]);
 
-	task_timer timer(flags & TARGET_PARALLEL ? 3 : UINT_MAX);
+	task_timer timer(flags & TARGET_PARALLEL ? config.target_parallel_verbosity : UINT_MAX);
 	if (config.comp_based_stats == 1) {
 		timer.go("Computing CBS");
 		for (unsigned i = 0; i < contexts; ++i)
@@ -154,7 +155,7 @@ vector<Match> extend(const Parameters &params, size_t query_id, hit* begin, hit*
 	const int source_query_len = align_mode.query_translated ? (int)query_source_seqs::get()[query_id].length() : (int)query_seqs::get()[query_id].length();
 
 	timer.go("Loading seed hits");
-	thread_local FlatArray<SeedHit> seed_hits, seed_hits_chunk;
+	TLS_FIX_S390X FlatArray<SeedHit> seed_hits, seed_hits_chunk;
 	thread_local vector<uint32_t> target_block_ids, target_block_ids_chunk;
 	thread_local vector<TargetScore> target_scores;
 	load_hits(begin, end, seed_hits, target_block_ids, target_scores);
@@ -169,34 +170,42 @@ vector<Match> extend(const Parameters &params, size_t query_id, hit* begin, hit*
 		timer.finish();
 	}
 
-	const size_t chunk_size = config.ext_chunk_size > 0 ? config.ext_chunk_size : target_block_ids.size();
+	const bool use_chunks = config.ext_chunk_size > 0 && config.max_alignments >= target_block_ids.size() && config.toppercent == 100.0;
+	const size_t chunk_size = use_chunks ? config.ext_chunk_size : target_block_ids.size();
+	const int relaxed_cutoff = score_matrix.rawscore(score_matrix.bitscore(config.max_evalue * config.relaxed_evalue_factor, (unsigned)query_seq[0].length()));
+	vector<TargetScore>::const_iterator i0 = target_scores.cbegin(), i1 = std::min(i0 + config.ext_chunk_size, target_scores.cend());
+	while (i1 < target_scores.cend() && i1->score >= relaxed_cutoff) ++i1;
+
 	vector<Target> aligned_targets;
-	for (vector<TargetScore>::const_iterator i = target_scores.cbegin(); i < target_scores.cend(); i += chunk_size) {
+	while(i0 < target_scores.cend()) {
 		seed_hits_chunk.clear();
 		target_block_ids_chunk.clear();
-		const vector<TargetScore>::const_iterator end = std::min(i + chunk_size, target_scores.cend());
-		const size_t chunk_size = (size_t)(end - i);
-		const bool multi_chunk = chunk_size < target_scores.size();
+		const size_t current_chunk_size = (size_t)(i1 - i0);
+		const bool multi_chunk = current_chunk_size < target_scores.size();
 
 		if (multi_chunk) {
-			for (vector<TargetScore>::const_iterator j = i; j < end; ++j) {
+			for (vector<TargetScore>::const_iterator j = i0; j < i1; ++j) {
 				target_block_ids_chunk.push_back(target_block_ids[j->target]);
 				seed_hits_chunk.push_back(seed_hits.begin(j->target), seed_hits.end(j->target));
 			}
 		}
 		else {
-			target_block_ids_chunk = std::move(target_block_ids);
-			seed_hits_chunk = std::move(seed_hits);
+			target_block_ids_chunk = TLS_FIX_S390X_MOVE(target_block_ids);
+			seed_hits_chunk = TLS_FIX_S390X_MOVE(seed_hits);
 		}
 
 		vector<Target> v = extend(params, query_id, query_seq.data(), query_cb.data(), seed_hits_chunk, target_block_ids_chunk, metadata, stat, flags);
+		const size_t n = v.size();
 		if (multi_chunk)
 			aligned_targets.insert(aligned_targets.end(), v.begin(), v.end());
 		else
-			aligned_targets = std::move(v);
+			aligned_targets = TLS_FIX_S390X_MOVE(v);
 
-		if ((double)v.size() / chunk_size < config.ext_min_yield)
+		if (use_chunks && (n == 0))
 			break;
+
+		i0 = i1;
+		i1 = std::min(i1 + chunk_size, target_scores.cend());
 	}
 
 	timer.go("Computing score only culling");

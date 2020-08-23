@@ -53,7 +53,7 @@ WorkTarget ungapped_stage(SeedHit *begin, SeedHit *end, const sequence *query_se
 		if (!diagonal_segments[hit->frame].empty() && diagonal_segments[hit->frame].back().diag() == hit->diag() && diagonal_segments[hit->frame].back().subject_end() >= hit->j)
 			continue;
 		const auto d = xdrop_ungapped(query_seq[hit->frame], target.seq, hit->i, hit->j);
-		if (d.score >= config.min_ungapped_raw_score) {
+		if (d.score > 0) {
 			target.ungapped_score = std::max(target.ungapped_score, d.score);
 			diagonal_segments[hit->frame].push_back(d);
 		}
@@ -62,7 +62,7 @@ WorkTarget ungapped_stage(SeedHit *begin, SeedHit *end, const sequence *query_se
 		if (diagonal_segments[frame].empty())
 			continue;
 		std::stable_sort(diagonal_segments[frame].begin(), diagonal_segments[frame].end(), Diagonal_segment::cmp_diag);
-		pair<int, list<Hsp_traits>> hsp = greedy_align(query_seq[frame], query_cb[frame], target.seq, diagonal_segments[frame].begin(), diagonal_segments[frame].end(), config.log_extend, frame);
+		pair<int, list<Hsp_traits>> hsp = greedy_align(query_seq[frame], target.seq, diagonal_segments[frame].begin(), diagonal_segments[frame].end(), config.log_extend, frame);
 		target.filter_score = std::max(target.filter_score, hsp.first);
 		target.hsp[frame] = std::move(hsp.second);
 		target.hsp[frame].sort(Hsp_traits::cmp_diag);

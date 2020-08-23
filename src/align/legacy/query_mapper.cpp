@@ -20,7 +20,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #include <algorithm>
 #include "query_mapper.h"
 #include "../../data/reference.h"
-#include "../extend_ungapped.h"
+#include "../../dp/ungapped.h"
 #include "../../output/output.h"
 #include "../../output/output_format.h"
 #include "../../output/daa_write.h"
@@ -125,7 +125,7 @@ unsigned QueryMapper::count_targets()
 		}
 		else {
 			const Diagonal_segment d = xdrop_ungapped(query_seq(frame), ref_seqs::get()[l.first], hits[i].seed_offset_, (int)l.second);
-			if (d.score >= config.min_ungapped_raw_score) {
+			if (d.score > 0) {
 				if (l.first != subject_id) {
 					subject_id = l.first;
 					++n_subject;

@@ -3,7 +3,7 @@ DIAMOND protein aligner
 Copyright (C) 2013-2020 Max Planck Society for the Advancement of Science e.V.
                         Benjamin Buchfink
                         Eberhard Karls Universitaet Tuebingen
-						
+
 Code developed by Benjamin Buchfink <benjamin.buchfink@tue.mpg.de>
 
 This program is free software: you can redistribute it and/or modify
@@ -21,6 +21,11 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 ****/
 
 #include <memory>
+#include <cstdlib>
+#include <sys/stat.h>
+#include <exception>
+#include <iomanip>
+#include <numeric>
 #include "../util/command_line_parser.h"
 #include "config.h"
 #include "../util/util.h"
@@ -38,10 +43,56 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #include "masking.h"
 #include "../util/system/system.h"
 #include "../util/simd.h"
+#include "../util/parallel/multiprocessing.h"
 
 using namespace std;
 
 Config config;
+
+void print_warnings() {
+	if (config.sensitivity >= Sensitivity::VERY_SENSITIVE || config.verbosity == 0)
+		return;
+	const double ram = total_ram();
+	unsigned b = 2, c = 4;
+	if (ram >= 511) {
+		b = 12;
+		c = 1;
+	} else if (ram >= 255) {
+		b = 8;
+		c = 1;
+	} else if (ram >= 127) {
+		b = 5;
+		c = 1;
+	} else if (ram >= 63) {
+		b = 6;
+	} else if (ram >= 31) {
+		b = 4;
+	}
+	if ((b > 2 && b > config.chunk_size) || c < config.lowmem) {
+		set_color(Color::YELLOW, true);
+		cerr << "The host system is detected to have " << (size_t)ram << " GB of RAM. It is recommended to increase the block size for better performance using these parameters: -b" << b;
+		if (c != 4)
+			cerr << " -c" << c;
+		cerr << endl;
+		reset_color(true);
+	}
+}
+
+template<typename _t>
+_t set_string_option(const string& s, const string& name, const vector<pair<string, _t>>& values) {
+	if (s.empty())
+		return (_t)0;
+	for (auto& i : values)
+		if (s == i.first)
+			return i.second;
+	throw std::runtime_error("Invalid argument for option " + name + ". Allowed values are:" + std::accumulate(values.begin(), values.end(), string(), [](const string& s, const pair<string, _t>& v) { return s + ' ' + v.first; }));
+}
+
+void Config::set_sens(Sensitivity sens) {
+	if (sensitivity != Sensitivity::FAST)
+		throw std::runtime_error("Sensitivity switches are mutually exclusive.");
+	sensitivity = sens;
+}
 
 Config::Config(int argc, const char **argv, bool check_io)
 {
@@ -81,11 +132,13 @@ Config::Config(int argc, const char **argv, bool check_io)
 		.add_command("split", "")
 		.add_command("upgma", "")
 		.add_command("upgmamc", "")
-		.add_command("test", "")
+		.add_command("test", "Run regression tests")
 		.add_command("reverse", "")
 		.add_command("compute-medoids", "")
 		.add_command("mutate", "")
 		.add_command("merge-tsv", "");
+
+	string traceback_mode_str;
 
 	Options_group general("General options");
 	general.add()
@@ -171,7 +224,7 @@ Config::Config(int argc, const char **argv, bool check_io)
 		("unal", 0, "report unaligned queries (0=no, 1=yes)", report_unaligned, -1)
 		("max-target-seqs", 'k', "maximum number of target sequences to report alignments for (default=25)", max_alignments, uint64_t(25))
 		("top", 0, "report alignments within this percentage range of top alignment score (overrides --max-target-seqs)", toppercent, 100.0)
-		("max-hsps", 0, "maximum number of HSPs per subject sequence to report for each query (default=unlimited)", max_hsps, 0u)
+		("max-hsps", 0, "maximum number of HSPs per target sequence to report for each query (default=1)", max_hsps, 1u)
 		("range-culling", 0, "restrict hit culling to overlapping query ranges", query_range_culling)
 		("compress", 0, "compression for output files (0=none, 1=gzip)", compression)
 		("evalue", 'e', "maximum e-value to report alignments (default=0.001)", max_evalue, 0.001)
@@ -181,9 +234,12 @@ Config::Config(int argc, const char **argv, bool check_io)
 		("subject-cover", 0, "minimum subject cover% to report an alignment", subject_cover)
 		("sensitive", 0, "enable sensitive mode (default: fast)", mode_sensitive)
 		("more-sensitive", 0, "enable more sensitive mode (default: fast)", mode_more_sensitive)
+		("very-sensitive", 0, "enable very sensitive mode (default: fast)", mode_very_sensitive)
+		("ultra-sensitive", 0, "enable ultra sensitive mode (default: fast)", mode_ultra_sensitive)
 		("block-size", 'b', "sequence block size in billions of letters (default=2.0)", chunk_size)
 		("index-chunks", 'c', "number of chunks for index processing (default=4)", lowmem)
 		("tmpdir", 't', "directory for temporary files", tmpdir)
+		("parallel-tmpdir", 0, "directory for temporary files used by multiprocessing", parallel_tmpdir)
 		("gapopen", 0, "gap open penalty", gap_open, -1)
 		("gapextend", 0, "gap extension penalty", gap_extend, -1)
 		("frameshift", 'F', "frame shift penalty (default=disabled)", frame_shift)
@@ -204,15 +260,19 @@ Config::Config(int argc, const char **argv, bool check_io)
 	Options_group advanced("Advanced options");
 	advanced.add()
 		("algo", 0, "Seed search algorithm (0=double-indexed/1=query-indexed)", algo, -1)
-		("bin", 0, "number of query bins for seed search", query_bins, 16u)
+		("bin", 0, "number of query bins for seed search", query_bins)
 		("min-orf", 'l', "ignore translated sequences without an open reading frame of at least this length", run_len)
 		("freq-sd", 0, "number of standard deviations for ignoring frequent seeds", freq_sd, 0.0)
 		("id2", 0, "minimum number of identities for stage 1 hit", min_identities)
 		("xdrop", 'x', "xdrop for ungapped alignment", ungapped_xdrop, 12.3)
 		("band", 0, "band for dynamic programming computation", padding)
-		("shapes", 's', "number of seed shapes (0 = all available)", shapes)
+		("shapes", 's', "number of seed shapes (default=all available)", shapes)
 		("shape-mask", 0, "seed shapes", shape_mask)
+		("multiprocessing", 0, "enable distributed-memory parallel processing", multiprocessing)
+		("mp-init", 0, "initialize multiprocessing run", mp_init)
 		("rank-ratio", 0, "include subjects within this ratio of last hit", rank_ratio, -1.0)
+		("ext-chunk-size", 0, "chunk size for adaptive ranking (default=400)", ext_chunk_size, (size_t)400)
+		("ext", 0, "Extension mode (banded-fast/banded-slow)", ext)
 		("culling-overlap", 0, "minimum range overlap with higher scoring hit to delete a hit (default=50%)", inner_culling_overlap, 50.0)
 		("taxon-k", 0, "maximum number of targets to report per species", taxon_k, (uint64_t)0)
 		("range-cover", 0, "percentage of query range to be covered for range culling (default=50%)", query_range_cover, 50.0)
@@ -221,7 +281,8 @@ Config::Config(int argc, const char **argv, bool check_io)
 		("xml-blord-format", 0, "Use gnl|BL_ORD_ID| style format in XML output", xml_blord_format)
 		("stop-match-score", 0, "Set the match score of stop codons against each other.", stop_match_score, 1)
 		("tantan-minMaskProb", 0, "minimum repeat probability for masking (default=0.9)", tantan_minMaskProb, 0.9)
-		("file-buffer-size", 0, "file buffer size in bytes (default=67108864)", file_buffer_size, (size_t)67108864);
+		("file-buffer-size", 0, "file buffer size in bytes (default=67108864)", file_buffer_size, (size_t)67108864)
+		("memory-limit", 'M', "Memory limit for extension stage in GB", memory_limit);
 
 	Options_group view_options("View options");
 	view_options.add()
@@ -233,6 +294,7 @@ Config::Config(int argc, const char **argv, bool check_io)
 		("seq", 0, "Sequence numbers to display.", seq_no);
 
 	double rank_ratio2;
+	unsigned window, min_ungapped_score, hit_band, min_hit_score;
 	Options_group deprecated_options("");
 	deprecated_options.add()
 		("window", 'w', "window size for local hit search", window)
@@ -257,7 +319,6 @@ Config::Config(int argc, const char **argv, bool check_io)
 		("reverse", 0, "", reverse)
 		("neighborhood-score", 0, "", neighborhood_score)
 		("seed-weight", 'w', "", seed_weight, 7u)
-		("very-sensitive", 0, "", mode_very_sensitive)
 		("idl", 0, "", id_left)
 		("idr", 0, "", id_right)
 		("idn", 0, "", id_n)
@@ -289,7 +350,6 @@ Config::Config(int argc, const char **argv, bool check_io)
 		("hashed-seeds", 0, "", hashed_seeds)
 		("rank-factor", 0, "", rank_factor, -1.0)
 		("transcript-len-estimate", 0, "", transcript_len_estimate, 1.0)
-		("no-traceback", 0, "", disable_traceback)
 		("family-counts", 0, "", family_counts_file)
 		("radix-cluster-buffered", 0, "", radix_cluster_buffered)
 		("join-split-size", 0, "", join_split_size, 100000u)
@@ -303,7 +363,7 @@ Config::Config(int argc, const char **argv, bool check_io)
 		("use-dataset-field", 0, "", use_dataset_field)
 		("store-query-quality", 0, "", store_query_quality)
 		("swipe-chunk-size", 0, "", swipe_chunk_size, 256u)
-		("query-parallel-limit", 0, "", query_parallel_limit, 1000000u)
+		("query-parallel-limit", 0, "", query_parallel_limit, 3000000u)
 		("hard-masked", 0, "", hardmasked)
 		("cbs-window", 0, "", cbs_window, 40)
 		("no-unlink", 0, "", no_unlink)
@@ -328,13 +388,12 @@ Config::Config(int argc, const char **argv, bool check_io)
 		("cutoff-score-8bit", 0, "", cutoff_score_8bit, 240)
 		("min-band-overlap", 0, "", min_band_overlap, 0.2)
 		("min-realign-overhang", 0, "", min_realign_overhang, 30)
-		("beta", 0, "", beta)
 		("ungapped-window", 0, "", ungapped_window, 48)
 		("gapped-filter-diag-score", 0, "", gapped_filter_diag_score, 20)
-		("gapped-filter-evalue", 0, "", gapped_filter_evalue, 0.0)
+		("gapped-filter-evalue", 0, "", gapped_filter_evalue, -1.0)
 		("gapped-filter-window", 0, "", gapped_filter_window, 200)
 		("output-hits", 0, "", output_hits)
-		("ungapped-evalue", 0, "", ungapped_evalue)
+		("ungapped-evalue", 0, "", ungapped_evalue, -1.0)
 		("no-logfile", 0, "", no_logfile)
 		("no-heartbeat", 0, "", no_heartbeat)
 		("band-bin", 0, "", band_bin, 24)
@@ -345,13 +404,30 @@ Config::Config(int argc, const char **argv, bool check_io)
 		("short-query-ungapped-bitscore", 0, "", short_query_ungapped_bitscore, 25.0)
 		("short-query-max-len", 0, "", short_query_max_len, 60)
 		("gapped-filter-evalue1", 0, "", gapped_filter_evalue1, 1.0e+04)
-		("ext-chunk-size", 0, "", ext_chunk_size, (size_t)0)
 		("ext-yield", 0, "", ext_min_yield)
-		("ext", 0, "", ext)
-		("full-sw-len", 0, "", full_sw_len);
+		("full-sw-len", 0, "", full_sw_len)
+		("relaxed-evalue-factor", 0, "", relaxed_evalue_factor, 1.0)
+		("type", 0, "", type)
+		("raw", 0, "", raw)
+		("chaining-len-cap", 0, "", chaining_len_cap, 2.0)
+		("chaining-min-nodes", 0, "", chaining_min_nodes, (size_t)200)
+		("fast-tsv", 0, "", fast_tsv)
+		("target-parallel-verbosity", 0, "", target_parallel_verbosity, UINT_MAX)
+		("ext-targets", 0, "", global_ranking_targets)
+		("traceback-mode", 0, "", traceback_mode_str)
+		("mid-sensitive", 0, "", mode_mid_sensitive);
 	
 	parser.add(general).add(makedb).add(cluster).add(aligner).add(advanced).add(view_options).add(getseq_options).add(hidden_options).add(deprecated_options);
 	parser.store(argc, argv, command);
+
+	traceback_mode = set_string_option<TracebackMode>(traceback_mode_str, "--traceback-mode",
+		{ {"score", TracebackMode::SCORE_ONLY },
+		{"stat", TracebackMode::STAT},
+		{"vector", TracebackMode::VECTOR},
+		{"buffer", TracebackMode::SCORE_BUFFER} });
+
+	if (toppercent != 100.0 && max_alignments != 25)
+		throw std::runtime_error("--top and --max-target-seqs are mutually exclusive.");
 
 	if (long_reads) {
 		query_range_culling = true;
@@ -511,11 +587,21 @@ Config::Config(int argc, const char **argv, bool check_io)
 		|| command == Config::mask || command == Config::cluster || command == Config::compute_medoids || command == Config::regression_test) {
 		if (tmpdir == "")
 			tmpdir = extract_dir(output_file);
-		
+
 		init_cbs();
 		raw_ungapped_xdrop = score_matrix.rawscore(ungapped_xdrop);
 		verbose_stream << "CPU features detected: " << SIMD::features() << endl;
 	}
+
+	sensitivity = Sensitivity::FAST;
+	if (mode_mid_sensitive) set_sens(Sensitivity::MID_SENSITIVE);
+	if (mode_sensitive) set_sens(Sensitivity::SENSITIVE);
+	if (mode_more_sensitive) set_sens(Sensitivity::MORE_SENSITIVE);
+	if (mode_very_sensitive) set_sens(Sensitivity::VERY_SENSITIVE);
+	if (mode_ultra_sensitive) set_sens(Sensitivity::ULTRA_SENSITIVE);
+
+	if (ext != "banded-fast" && ext != "banded-slow" && ext != "")
+		throw std::runtime_error("Possible values for --ext are: banded-fast, banded-slow");
 
 	Translator::init(query_gencode);
 
@@ -545,8 +631,27 @@ Config::Config(int argc, const char **argv, bool check_io)
 	if (query_range_culling && taxon_k != 0)
 		throw std::runtime_error("--taxon-k is not supported for --range-culling mode.");
 
-	if (beta && (lowmem != 1))
-		throw std::runtime_error("--beta needs -c1.");
+	if (parallel_tmpdir == "") {
+		parallel_tmpdir = tmpdir;
+	} else {
+#ifndef WIN32
+		if (multiprocessing) {
+			// char * env_str = std::getenv("SLURM_JOBID");
+			// if (env_str) {
+			// 	parallel_tmpdir = join_path(parallel_tmpdir, "diamond_job_"+string(env_str));
+			// }
+			errno = 0;
+			int s = mkdir(parallel_tmpdir.c_str(), 00770);
+			if (s != 0) {
+				if (errno == EEXIST) {
+					// directory did already exist
+				} else {
+					throw(std::runtime_error("could not create parallel temporary directory " + parallel_tmpdir));
+				}
+			}
+		}
+#endif
+	}
 
 	log_stream << "MAX_SHAPE_LEN=" << MAX_SHAPE_LEN;
 #ifdef SEQ_MASK

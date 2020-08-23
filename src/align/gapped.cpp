@@ -33,7 +33,7 @@ namespace Extension {
 int band(int len) {
 	if (config.padding > 0)
 		return config.padding;
-	if (config.beta) {
+	if ((config.sensitivity <= Sensitivity::SENSITIVE && config.ext != "banded-slow") || config.ext == "banded-fast") {
 		if (len < 50)
 			return 12;
 		if (len < 100)
@@ -166,7 +166,7 @@ void add_dp_targets(const Target &target, int target_idx, const sequence *query_
 	for (unsigned frame = 0; frame < align_mode.query_contexts; ++frame) {
 		const int qlen = (int)query_seq[frame].length();
 		for (const Hsp &hsp : target.hsp[frame]) {
-			vector<DpTarget> &v = hsp.score < 255 ? dp_targets[frame][0] : dp_targets[frame][1];
+			vector<DpTarget>& v = hsp.score < 255 && (hsp.query_range.end_ - hsp.query_range.begin_ < 256) ? dp_targets[frame][0] : dp_targets[frame][1];
 			v.emplace_back(target.seq, hsp.query_range.begin_, hsp.query_range.end_, hsp.subject_range.begin_, hsp.subject_range.end_, target_idx);
 		}
 	}
@@ -181,7 +181,7 @@ vector<Match> align(vector<Target> &targets, const sequence *query_seq, const Bi
 		return r;
 	r.reserve(targets.size());
 
-	if (config.disable_traceback || config.ext == "full") {
+	if (config.traceback_mode == TracebackMode::SCORE_ONLY || config.ext == "full") {
 		for (Target &t : targets)
 			r.emplace_back(t.block_id, t.outranked, t.hsp, t.ungapped_score);
 		return r;

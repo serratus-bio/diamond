@@ -3,7 +3,7 @@ DIAMOND protein aligner
 Copyright (C) 2013-2020 Max Planck Society for the Advancement of Science e.V.
                         Benjamin Buchfink
                         Eberhard Karls Universitaet Tuebingen
-						
+
 Code developed by Benjamin Buchfink <benjamin.buchfink@tue.mpg.de>
 
 This program is free software: you can redistribute it and/or modify
@@ -25,6 +25,9 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #include <vector>
 #include <stdint.h>
 
+enum class Sensitivity { FAST = 0, MID_SENSITIVE = 1, SENSITIVE = 2, MORE_SENSITIVE = 3, VERY_SENSITIVE = 4, ULTRA_SENSITIVE = 5 };
+enum class TracebackMode { NONE = 0, SCORE_ONLY = 1, STAT = 2, VECTOR = 3, SCORE_BUFFER = 4 };
+
 struct Config
 {
 
@@ -37,8 +40,6 @@ struct Config
 	string	query_file;
 	unsigned	merge_seq_treshold;
 	unsigned	hit_cap;
-	double min_ungapped_score;
-	int		min_ungapped_raw_score;
 	unsigned shapes;
 	unsigned	index_mode;
 	uint64_t	max_alignments;
@@ -53,18 +54,14 @@ struct Config
 	unsigned min_identities2;
 	double ungapped_xdrop;
 	int		raw_ungapped_xdrop;
-	unsigned window;
-	double		min_hit_score;
-	int min_hit_raw_score;
-	int		hit_band;
 	unsigned	min_compressed_identities;
 	int		min_seed_score;
 	unsigned	seed_signatures;
 	double	min_bit_score;
 	unsigned	run_len;
-	bool		disable_traceback;
 	double	max_seed_freq;
 	string	tmpdir;
+	string	parallel_tmpdir;
 	bool		long_mode;
 	int		gapped_xdrop;
 	double	max_evalue;
@@ -105,7 +102,6 @@ struct Config
 	string matrix_file;
 	double lambda, K;
 	string_vector shape_mask;
-	unsigned seed_anchor;
 	unsigned query_gencode;
 	string unaligned;
 	double space_penalty;
@@ -202,7 +198,6 @@ struct Config
 	double inner_culling_overlap;
 	double min_band_overlap;
 	int min_realign_overhang;
-	bool beta;
 	int ungapped_window;
 	int gapped_filter_diag_score;
 	double gapped_filter_evalue;
@@ -224,6 +219,23 @@ struct Config
 	double ext_min_yield;
 	string ext;
 	int full_sw_len;
+	double relaxed_evalue_factor;
+	string type;
+	bool raw;
+	bool mode_ultra_sensitive;
+	double chaining_len_cap;
+	size_t chaining_min_nodes;
+	bool fast_tsv;
+	unsigned target_parallel_verbosity;
+	double memory_limit;
+	size_t global_ranking_targets;
+	bool mode_mid_sensitive;
+
+	Sensitivity sensitivity;
+	TracebackMode traceback_mode;
+
+	bool multiprocessing;
+	bool mp_init;
 
 	enum {
 		makedb = 0, blastp = 1, blastx = 2, view = 3, help = 4, version = 5, getseq = 6, benchmark = 7, random_seqs = 8, compare = 9, sort = 10, roc = 11, db_stat = 12, model_sim = 13,
@@ -270,38 +282,13 @@ struct Config
 			return n_target_seq < max_alignments;
 	}
 
-	/*unsigned read_padding(size_t len)
-	{
-		if (padding == 0) {
-			if (len <= 255)
-				return 10;
-			else
-				return 32;
-		}
-		else
-			return padding;
-	}*/
-
-	unsigned read_padding(size_t len)
-	{
-		if (padding == 0) {
-			if (mode_very_sensitive)
-				return 60;
-			else if (len <= 35)
-				return 5;
-			else if (len <= 55)
-				return 16;
-			else
-				return 32;
-		}
-		else
-			return padding;
-	}
+	void set_sens(Sensitivity sens);
 
 	bool mem_buffered() const { return tmpdir == "/dev/shm"; }
 
   	template<typename _t>
-	static void set_option(_t& option, _t value) { if (option == 0) option = value; }
+	static void set_option(_t& option, _t value, _t def = 0) { if (option == def) option = value; }
 };
 
+void print_warnings();
 extern Config config;

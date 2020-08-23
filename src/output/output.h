@@ -1,6 +1,10 @@
 /****
 DIAMOND protein aligner
-Copyright (C) 2013-2017 Benjamin Buchfink <buchfink@gmail.com>
+Copyright (C) 2013-2020 Max Planck Society for the Advancement of Science e.V.
+                        Benjamin Buchfink
+                        Eberhard Karls Universitaet Tuebingen
+						
+Code developed by Benjamin Buchfink <benjamin.buchfink@tue.mpg.de>
 
 This program is free software: you can redistribute it and/or modify
 it under the terms of the GNU General Public License as published by
@@ -16,9 +20,7 @@ You should have received a copy of the GNU General Public License
 along with this program.  If not, see <http://www.gnu.org/licenses/>.
 ****/
 
-#ifndef OUTPUT_H_
-#define OUTPUT_H_
-
+#pragma once
 #include <memory>
 #include <map>
 #include <mutex>
@@ -31,6 +33,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #include "../basic/parameters.h"
 #include "../data/metadata.h"
 #include "../util/io/consumer.h"
+#include "output_format.h"
 
 inline unsigned get_length_flag(unsigned x)
 {
@@ -71,11 +74,23 @@ struct IntermediateRecord
 		f.read(subject_id);
 		f.read(flag);
 		f.read_packed(flag & 3, score);
-		if (!config.disable_traceback) {
-			f.read_packed((flag >> 2) & 3, query_begin);
-			f.read_varint(query_end);
-			f.read_packed((flag >> 4) & 3, subject_begin);
+
+		if (!output_format->needs_transcript && !output_format->needs_stats)
+			return;
+
+		f.read_packed((flag >> 2) & 3, query_begin);
+		f.read_varint(query_end);
+		f.read_packed((flag >> 4) & 3, subject_begin);
+
+		if (output_format->needs_transcript)
 			transcript.read(f);
+		else if (output_format->needs_stats) {
+			f.read_varint(subject_end);
+			f.read_varint(identities);
+			f.read_varint(mismatches);
+			f.read_varint(positives);
+			f.read_varint(gap_openings);
+			f.read_varint(gaps);
 		}
 	}
 	interval absolute_query_range() const
@@ -101,11 +116,22 @@ struct IntermediateRecord
 		buf.write(ReferenceDictionary::get().get(current_ref_block, subject_id));
 		buf.write(get_segment_flag(match));
 		buf.write_packed(match.score);
-		if (!config.disable_traceback) {
-			buf.write_packed(oriented_range.begin_);
-			buf.write_varint(oriented_range.end_);
-			buf.write_packed(match.subject_range.begin_);
+		if (!output_format->needs_transcript && !output_format->needs_stats)
+			return;
+
+		buf.write_packed(oriented_range.begin_);
+		buf.write_varint(oriented_range.end_);
+		buf.write_packed(match.subject_range.begin_);
+
+		if(output_format->needs_transcript)
 			buf << match.transcript.data();
+		else if (output_format->needs_stats) {
+			buf.write_varint(match.subject_range.end_);
+			buf.write_varint(match.identities);
+			buf.write_varint(match.mismatches);
+			buf.write_varint(match.positives); 
+			buf.write_varint(match.gap_openings);
+			buf.write_varint(match.gaps);
 		}
 	}
 	static void finish_file(Consumer &f)
@@ -114,12 +140,13 @@ struct IntermediateRecord
 		f.consume(reinterpret_cast<const char*>(&i), 4);
 	}
 	static const uint32_t FINISHED = 0xffffffffu;
-	uint32_t query_id, subject_id, score, query_begin, subject_begin, query_end;
+	uint32_t query_id, subject_id, score, query_begin, subject_begin, query_end, subject_end, identities, mismatches, positives, gap_openings, gaps;
 	uint8_t flag;
 	Packed_transcript transcript;
 };
 
-void join_blocks(unsigned ref_blocks, Consumer &master_out, const PtrVector<TempFile> &tmp_file, const Parameters &params, const Metadata &metadata, DatabaseFile &db_file);
+void join_blocks(unsigned ref_blocks, Consumer &master_out, const PtrVector<TempFile> &tmp_file, const Parameters &params, const Metadata &metadata, DatabaseFile &db_file,
+					const vector<string> tmp_file_names = vector<string>());
 
 struct OutputSink
 {
@@ -160,5 +187,3 @@ private:
 };
 
 void heartbeat_worker(size_t qend);
-
-#endif
